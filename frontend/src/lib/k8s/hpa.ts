@@ -23,18 +23,21 @@ export interface CrossVersionObjectReference {
   name: string;
 }
 
+interface MetricLabelSelector {
+  matchLabels?: {
+    [key: string]: string;
+  };
+  matchExpressions?: {
+    key: string;
+    operator: string;
+    // Exists and DoesNotExist requirements omit values entirely.
+    values?: string[];
+  }[];
+}
+
 interface MetricIdentifier {
   name: string;
-  selector: {
-    matchLabels: {
-      [key: string]: string;
-    };
-    matchExpressions: {
-      key: string;
-      operator: string;
-      values: string[];
-    };
-  };
+  selector?: MetricLabelSelector;
 }
 
 interface MetricValueStatus {
@@ -144,7 +147,7 @@ interface HpaStatus {
         object?: {
           current: MetricValueStatus;
           metric: MetricIdentifier;
-          desiredObject: CrossVersionObjectReference;
+          describedObject: CrossVersionObjectReference;
         };
         pods?: {
           current: MetricValueStatus;
@@ -181,6 +184,141 @@ interface HPAMetrics {
   shortValue: string;
 }
 
+/**
+ * Compares two metric selectors by value rather than by serialization.
+ *
+ * The API server round-trips selectors between spec and status, so omitted and
+ * empty selectors mean the same thing and the requirements in matchLabels and
+ * matchExpressions can be written in any order. Two selectors are equal when
+ * they require exactly the same labels and expressions, regardless of spelling.
+ */
+function isSameSelector(a?: MetricLabelSelector, b?: MetricLabelSelector): boolean {
+  const aLabels = a?.matchLabels || {};
+  const bLabels = b?.matchLabels || {};
+  const aLabelKeys = Object.keys(aLabels);
+  const bLabelKeys = Object.keys(bLabels);
+  if (aLabelKeys.length !== bLabelKeys.length) {
+    return false;
+  }
+  for (const key of aLabelKeys) {
+    if (aLabels[key] !== bLabels[key]) {
+      return false;
+    }
+  }
+
+  const aExpressions = a?.matchExpressions || [];
+  const bExpressions = b?.matchExpressions || [];
+  if (aExpressions.length !== bExpressions.length) {
+    return false;
+  }
+
+  const normalizeExpression = (expression: {
+    key: string;
+    operator: string;
+    values?: string[];
+  }) => ({
+    key: expression.key,
+    operator: expression.operator,
+    // Exists and DoesNotExist requirements omit values; treat that as no
+    // values rather than failing to iterate undefined.
+    values: [...(expression.values || [])].sort(),
+  });
+
+  const aSorted = aExpressions
+    .map(normalizeExpression)
+    .sort((x, y) =>
+      x.key === y.key
+        ? x.operator === y.operator
+          ? JSON.stringify(x.values).localeCompare(JSON.stringify(y.values))
+          : x.operator.localeCompare(y.operator)
+        : x.key.localeCompare(y.key)
+    );
+  const bSorted = bExpressions
+    .map(normalizeExpression)
+    .sort((x, y) =>
+      x.key === y.key
+        ? x.operator === y.operator
+          ? JSON.stringify(x.values).localeCompare(JSON.stringify(y.values))
+          : x.operator.localeCompare(y.operator)
+        : x.key.localeCompare(y.key)
+    );
+
+  return aSorted.every((expression, index) => {
+    const other = bSorted[index];
+    return (
+      expression.key === other.key &&
+      expression.operator === other.operator &&
+      expression.values.length === other.values.length &&
+      expression.values.every((value, i) => value === other.values[i])
+    );
+  });
+}
+
+/**
+ * Compares two cross-version object references by identity.
+ */
+function isSameObjectRef(
+  a?: CrossVersionObjectReference,
+  b?: CrossVersionObjectReference
+): boolean {
+  return (
+    (a?.apiVersion || '') === (b?.apiVersion || '') &&
+    (a?.kind || '') === (b?.kind || '') &&
+    (a?.name || '') === (b?.name || '')
+  );
+}
+
+/**
+ * Picks the status entry that reports a given spec metric.
+ *
+ * `status.currentMetrics` lists only the metrics the HPA controller managed to
+ * read, so a metric that failed is absent and the entries after it shift left.
+ * Matching by position therefore pairs a spec metric with an unrelated status
+ * entry, which silently shows another metric's values. The entries have to be
+ * matched by the identity the controller writes them with: the source type plus
+ * the resource, container, metric name, metric selector or described object
+ * they refer to.
+ */
+function findCurrentMetric(
+  spec: HpaSpec['metrics'][number],
+  currentMetrics: HpaStatus['currentMetrics']
+) {
+  return currentMetrics?.find(status => {
+    if (status.type !== spec.type) {
+      return false;
+    }
+    if (spec.resource) {
+      return status.resource?.name === spec.resource.name;
+    }
+    if (spec.containerResource) {
+      return (
+        status.containerResource?.name === spec.containerResource.name &&
+        status.containerResource?.container === spec.containerResource.container
+      );
+    }
+    if (spec.pods) {
+      return (
+        status.pods?.metric?.name === spec.pods.metric?.name &&
+        isSameSelector(status.pods.metric?.selector, spec.pods.metric?.selector)
+      );
+    }
+    if (spec.object) {
+      return (
+        status.object?.metric?.name === spec.object.metric?.name &&
+        isSameSelector(status.object.metric?.selector, spec.object.metric?.selector) &&
+        isSameObjectRef(status.object?.describedObject, spec.object.describedObject)
+      );
+    }
+    if (spec.external) {
+      return (
+        status.external?.metric?.name === spec.external.metric?.name &&
+        isSameSelector(status.external.metric?.selector, spec.external.metric?.selector)
+      );
+    }
+    return false;
+  });
+}
+
 class HPA extends KubeObject<KubeHPA> {
   static kind = 'HorizontalPodAutoscaler';
   static apiName = 'horizontalpodautoscalers';
@@ -211,7 +349,7 @@ class HPA extends KubeObject<KubeHPA> {
     const specMetrics = this.spec?.metrics || [];
     for (let iter = 0; iter < specMetrics.length; iter++) {
       const spec = specMetrics[iter];
-      const status = this.status?.currentMetrics?.[iter];
+      const status = findCurrentMetric(spec, this.status?.currentMetrics);
       switch (spec.type) {
         case 'External':
           {

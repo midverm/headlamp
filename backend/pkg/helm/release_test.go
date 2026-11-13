@@ -192,6 +192,10 @@ func TestListRelease(t *testing.T) {
 func TestUpgradeRelease(t *testing.T) {
 	helmHandler := newHelmHandler(t)
 
+	// upgrade resolves the chart from the repository, so add it for this
+	// test's own isolated helm configuration.
+	testAddRepo(t, helmHandler, "headlamp_test_repo", "https://kubernetes-sigs.github.io/headlamp/")
+
 	upgradeReq := helm.UpgradeReleaseRequest{
 		CommonInstallUpdateRequest: helm.CommonInstallUpdateRequest{
 			Name:        "helm-test-asdf",
